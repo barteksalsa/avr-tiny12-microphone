@@ -1,7 +1,21 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-register unsigned char pwmFastCount asm("r6"); /* soft divider to help lower PFM freq to 300Hz */
+/*
+
+Assumptions:
+- the CPU, by entering active mode will "steal" current from LEDs and in this way
+  will make them "dim". 
+
+- the control transistor output will be attached to PB3 (PDIP-2)
+
+- the debug pin will be PB4 (PDIP-3)
+
+- the sense input will be PB1 (or INT0) (PDIP-6)
+
+*/
+
+register unsigned char intFlagButton asm("r6"); /* flag to be used between interrupts */
 register unsigned char savedR24 asm("r7");     /* interrupt helper to restore r24,r25 */
 register unsigned char savedR25 asm("r8");     /* interrupt helper to restore r24,r25 */
 register unsigned char pwmFill asm("r9");      /* current fill of PWM. 0-31 */
@@ -16,13 +30,9 @@ void disableInt0(void);
 /*
  *  PINS in PORTB setup
  */
-#define PWMOUTPIN1  4
-#define PWMOUTPIN2  3
-#define PWMOUTPIN3  0
-#define PWMOUTPIN4  2
-
-#define RS232PIN   1
-
+#define PWRSUPPORT  3
+#define DEBUGPIN    4
+#define BUTTONSENSE 1
 
 /*
  *  LOCAL DEFINITION OF SPECIAL REGISTERS -- the code is compiled for tiny2313 which may have different
@@ -69,17 +79,17 @@ void disableInt0(void);
  *  Using ACSR to return flags from Timer Interrupt.
  *  Register variables are non-volatile by default, so hacking is needed
  */
-void clrFlagReceivedChar(void)
+void clrFlagButton(void)
 {
     ACSR &= ~_BV(0);
 }
 
-void setFlagReceivedChar(void)
+void setFlagButton(void)
 {
     ACSR |= _BV(0);
 }
 
-uint8_t getFlagReceivedChar(void)
+uint8_t getFlagButton(void)
 {
     return (ACSR & _BV(0));
 }
@@ -103,17 +113,17 @@ uint8_t getFlagCollectSamples(void)
 
 
 
-void clrFlag300Hz(void)
+void clrFlag200ms(void)
 {
     ACSR &= ~_BV(6);
 }
 
-void setFlag300Hz(void)
+void setFlag200ms(void)
 {
     ACSR |= _BV(6);
 }
 
-uint8_t getFlag300Hz(void)
+uint8_t getFlag200ms(void)
 {
     return (ACSR & _BV(6));
 }
@@ -128,13 +138,13 @@ ISR(_VECTOR(1), ISR_NAKED)
     asm("mov r7, r24"::);
     asm("mov r8, r25"::);
 
-    /* a new pin change has shown, start counting to finish at the middle and rewind the timer */
-    TCNT0 = 256 - 20; /* TCNT0: next interrupt should come in the middle of a character */
+    disableInt0();  /* disable the interrupt <= we need to debounce, will be done in
+                       timer routine. Will ruin 200ms, but action will be taken anyway.
+                       Timer will handle debouncing and re-enable INT0 */
+    TCNT0 = 256 - (234 / 4); /* 200ms should do */
     TIFR |= _BV(1);  /* clear TOV0 interrupt flag in case the timer just fired */
-
-    setFlagCollectSamples();  /* start collecting bits */
-    bitCounter = 9; /* 10 bits for 8N1 format, 0 also counts as bit */
-    disableInt0();  /* disable the interrupt because in the frame there will be a few high bits */
+    intFlagButton = 1; /* inform timer interrupt about keyboard */
+    setFlagButton();
 
     /* restore r24, r25 and return */
     asm("mov r24, r7"::);
@@ -155,7 +165,6 @@ void enableInt0(void)
 
 void setupInt0(void)
 {
-    clrFlagCollectSamples();
     MCUCR |= _BV(ISC01) | _BV(ISC00); /* The rising edge of INT0 generates an interrupt request */
     enableInt0();
 }
@@ -170,95 +179,41 @@ ISR(_VECTOR(3), ISR_NAKED)
     asm("mov r8, r25"::);
 
     /* rewind timer - must be first */
-    TCNT0 = 256 - 110/*117*/; /* TCNT0: need to count 25 ticks */
+    TCNT0 = 256 - 234; /* TCNT0: target delay is 200ms */
 
-    /* handle PWM */
-    ++pwmFastCount;
-    if ((pwmFastCount & 32) == 32)  /* 9600 / 32 = 300 */
+    if (intFlagButton == 0)
     {
-        pwmFastCount = 0;
-        /* enable PWM pin here */
-        PORTB |= _BV(PWMOUTPIN1) | _BV(PWMOUTPIN2) | _BV(PWMOUTPIN3) | _BV(PWMOUTPIN4);
+        setFlag200ms();
     }
-    if (pwmFastCount >= pwmFill)
+#if 1
+    else  /* timer fired because of button press */
     {
-        /* disable PWM pin when counter */
-        PORTB &= ~(_BV(PWMOUTPIN1) | _BV(PWMOUTPIN2) | _BV(PWMOUTPIN3) | _BV(PWMOUTPIN4));
-    }
-
-    /* handle UART */
-    if (getFlagCollectSamples())
-    {
-        if (bitCounter == 9)  {  --bitCounter;  receivedChar = 0;  }
-        else
+        intFlagButton = 0; /* re-enable the button interrupt */
+        if ((PINB & _BV(BUTTONSENSE)) != 0)
         {
-             if (bitCounter > 0)
-             {
-                 --bitCounter;
-                 receivedChar = (receivedChar >> 1);
-                 if ((PINB & _BV(RS232PIN)) == 0)
-                 {
-                     receivedChar |= 0x80; /* set bit if something comes from RS */
-                 }
-             }
-             else /* bitCounter == 0 */ 
-            {  
-                clrFlagCollectSamples(); /* re-enable reception of new characters */
-                enableInt0();
-                setFlagReceivedChar();  /* inform task that there is new character */
-            }
+            PORTB |= _BV(PWRSUPPORT);
+            setFlagButton();
         }
+        //enableInt0();
     }
-
-    /* for delay loops */
-    setFlag300Hz();
-
+#endif
     /* restore r24, r25 and return */
     asm("mov r24, r7"::);
     asm("mov r25, r8"::);
     reti();
 }
 
-
-
 void setupTimer(void)
 {
-    TCCR0 = 1; /* TCCR0 set timer to CLK/1 */
+    TCCR0 = 5; /* TCCR0 set timer to CLK/1024 */
     TIMSK = _BV(TOIE0);
 }
 
-
 void calibrateOscillator(void)
 {
-    _SFR_IO8(0x31) = 0x27; /* OSCCAL 0x27 read from avrdude -Ucalibrate */
+    _SFR_IO8(0x31) = 0x40; /* some adjustable value */
 }
 
-void setupPwm(void)
-{
-    pwmFill = 0;
-}
-
-void setPwm(uint8_t newPwmFill)
-{
-    pwmFill = newPwmFill;
-}
-
-uint8_t getPwm(void)
-{
-    return pwmFill;
-}
-
-void incPwm(void)
-{
-    if (pwmFill < 32)
-    {
-        pwmFill = pwmFill + 1;
-    }
-    else
-    {
-        pwmFill = 0;
-    }
-}
 
 
 void enableSleep(void)
@@ -272,43 +227,44 @@ int main(void)
     asm volatile("eor	r1, r1"::);
 
     /* initialise */
-    DDRB = _BV(PWMOUTPIN1) | _BV(PWMOUTPIN2) | _BV(PWMOUTPIN3) | _BV(PWMOUTPIN4) ;
+    DDRB = _BV(DEBUGPIN) | _BV(PWRSUPPORT);
+    PORTB = 0;
     calibrateOscillator();
     setupTimer();
-    setupPwm();
     setupInt0();
     enableSleep();
+    intFlagButton = 0;
     sei();
-
-    /* Soft start */
-    for (counter2 = 0; counter2 < 64; ++counter2)
-    {
-        for (counter = 0; counter < 250; ++counter)
-        {
-            if (getFlag300Hz())
-            {
-                cli();
-                clrFlag300Hz();
-                sei();
-                asm("sleep"::);
-            }
-        }
-        setPwm(counter2 >> 2);
-    }
-
 
     /* Normal loop */
     for (;;)
     {
-        if (getFlagReceivedChar())
+
+        if (getFlag200ms() != 0)
         {
             cli();
-            clrFlagReceivedChar();
+            clrFlag200ms();
             sei();
-            setPwm(receivedChar & 0x1F);
+            PORTB ^= _BV(DEBUGPIN);
         }
 
+
+
+        if (getFlagButton() != 0)
+        {
+            if ((PINB & _BV(BUTTONSENSE)) == 0)
+            {
+                cli();
+                clrFlagButton();
+                sei();
+                PORTB &= ~_BV(PWRSUPPORT);
+                enableInt0();
+            }
+        }
+
+
         asm("sleep"::);
+
     }
 }
 
