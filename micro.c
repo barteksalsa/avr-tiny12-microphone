@@ -15,14 +15,25 @@ Assumptions:
 
 */
 
-register unsigned char intFlagButton asm("r6"); /* flag to be used between interrupts */
+#define COUNTING_TIMEOUT_S (60 * 9)
+#define WARNING_TIMEOUT_S  (60 * 1)
+
+
+typedef enum
+{
+    STATE_COUNTING,
+    STATE_WARNING,
+    STATE_OFF,
+} app_state_t;
+
+
+
+register unsigned char timerForButtonFlag asm("r6"); /* flag to be used between interrupts */
 register unsigned char savedR24 asm("r7");     /* interrupt helper to restore r24,r25 */
 register unsigned char savedR25 asm("r8");     /* interrupt helper to restore r24,r25 */
-register unsigned char pwmFill asm("r9");      /* current fill of PWM. 0-31 */
-register unsigned char counter asm("r10");
+register unsigned char appState asm("r9");      /* current fill of PWM. 0-31 */
+register unsigned char counter1 asm("r10");
 register unsigned char counter2 asm("r11");
-register unsigned char bitCounter asm("r12");   /* counter for received bits */
-register unsigned char receivedChar asm("r13"); /* register for received character */
 
 void disableInt0(void);
 
@@ -143,8 +154,7 @@ ISR(_VECTOR(1), ISR_NAKED)
                        Timer will handle debouncing and re-enable INT0 */
     TCNT0 = 256 - (234 / 4); /* 200ms should do */
     TIFR |= _BV(1);  /* clear TOV0 interrupt flag in case the timer just fired */
-    intFlagButton = 1; /* inform timer interrupt about keyboard */
-    setFlagButton();
+    timerForButtonFlag = 1; /* inform timer interrupt about keyboard */
 
     /* restore r24, r25 and return */
     asm("mov r24, r7"::);
@@ -181,22 +191,24 @@ ISR(_VECTOR(3), ISR_NAKED)
     /* rewind timer - must be first */
     TCNT0 = 256 - 234; /* TCNT0: target delay is 200ms */
 
-    if (intFlagButton == 0)
+    if (timerForButtonFlag == 0)
     {
         setFlag200ms();
+        /* re-enable button interrupts when released */
+        if ((PINB & _BV(BUTTONSENSE)) == 0)
+        {
+            enableInt0();
+        }
     }
-#if 1
     else  /* timer fired because of button press */
     {
-        intFlagButton = 0; /* re-enable the button interrupt */
+        timerForButtonFlag = 0; /* re-enable the button interrupt */
         if ((PINB & _BV(BUTTONSENSE)) != 0)
         {
-            PORTB |= _BV(PWRSUPPORT);
             setFlagButton();
         }
-        //enableInt0();
     }
-#endif
+
     /* restore r24, r25 and return */
     asm("mov r24, r7"::);
     asm("mov r25, r8"::);
@@ -221,6 +233,139 @@ void enableSleep(void)
     MCUCR |= _BV(SE);
 }
 
+void disableSleep(void)
+{
+    MCUCR &= ~_BV(SE);
+}
+
+
+void enterState(app_state_t newState)
+{
+    /* state exit procedure */
+    switch (appState)
+    {
+        case STATE_WARNING:
+            enableSleep();
+            break;
+        default:
+            break;
+    }
+
+    /* state enter procedure */
+    switch (newState)
+    {
+        case STATE_COUNTING:
+            counter1 = 0; /* 5 Hz */
+            counter2 = 0; /* 30 sec */
+            appState = STATE_COUNTING;
+            break;
+
+        case STATE_WARNING:
+            counter1 = 0; /* 5 Hz */
+            counter2 = 0; /* 30 sec */
+            appState = STATE_WARNING;
+            break;
+
+        case STATE_OFF:
+            PORTB &= ~_BV(PWRSUPPORT);
+            appState = STATE_OFF;
+            break;
+    }
+}
+
+
+/**
+ *  Runs every 200ms. Actions depend on the app state
+ */
+void handleTimerTick(void)
+{
+    /* handle timer ticks */
+    if (counter1 == (5 * 30))
+    {
+        counter1 = 0;
+        ++counter2;
+    }
+    else
+    {
+        ++counter1;
+    }
+
+    switch (appState)
+    {
+        case STATE_COUNTING:
+            if (counter2 == (COUNTING_TIMEOUT_S / 30))
+            {
+                enterState(STATE_WARNING);
+            }
+            break;
+
+        case STATE_WARNING:
+            if ((counter1 & 0x2) != 0) /* led dimming effect */
+            {
+                disableSleep();
+                PORTB ^= _BV(DEBUGPIN);
+            }
+            else
+            {
+                PORTB ^= _BV(DEBUGPIN);
+                enableSleep();
+            }
+            if (counter2 == (WARNING_TIMEOUT_S / 30))
+            {
+                enterState(STATE_OFF);
+            }
+            break;
+
+        case STATE_OFF:  /* wait until switched off */
+            break;
+    }
+}
+
+
+/**
+ *  Button press handler
+ */
+void handleButtonPressed(void)
+{
+    switch (appState)
+    {
+        case STATE_COUNTING:  /* button when counting = goto OFF */
+            enterState(STATE_OFF);
+            break;
+
+        case STATE_WARNING:   /* button when warning = restart counting */
+            enterState(STATE_COUNTING);
+            break;
+
+        case STATE_OFF: /* when in state OFF, do nothing, wait until power goes off */
+            break;
+    }
+}
+
+
+void showState(void)
+{
+    switch (appState)
+    {
+        case STATE_COUNTING:
+            PORTB = _BV(PWRSUPPORT);
+            break;
+        case STATE_WARNING:
+            PORTB = _BV(DEBUGPIN);
+            break;
+        case STATE_OFF:
+            PORTB = _BV(PWRSUPPORT) | _BV(DEBUGPIN);
+            break;
+        default:
+            PORTB = 0;
+            break;
+    }
+}
+
+
+/**
+ *  main loop
+ */
 int main(void)
 {
     /* hack to provide minimum C runtime */
@@ -228,43 +373,52 @@ int main(void)
 
     /* initialise */
     DDRB = _BV(DEBUGPIN) | _BV(PWRSUPPORT);
-    PORTB = 0;
     calibrateOscillator();
     setupTimer();
     setupInt0();
     enableSleep();
-    intFlagButton = 0;
+    PORTB = _BV(PWRSUPPORT);  /* enable external power supply */
+    timerForButtonFlag = 0;
+    counter1 = 0;
+    counter2 = 0;
+    appState = STATE_OFF;
+    enterState(STATE_COUNTING);
     sei();
 
     /* Normal loop */
     for (;;)
     {
 
+        if (appState == STATE_OFF)
+        {
+            asm("sleep"::);
+            continue;
+        }
+
+#if 0
+        showState();
+#endif
+
+        /* handle timer tick */
         if (getFlag200ms() != 0)
         {
             cli();
             clrFlag200ms();
             sei();
-            PORTB ^= _BV(DEBUGPIN);
+            handleTimerTick();
         }
 
 
-
+        /* handle button press. We know it is pressed, call handler */
         if (getFlagButton() != 0)
         {
-            if ((PINB & _BV(BUTTONSENSE)) == 0)
-            {
-                cli();
-                clrFlagButton();
-                sei();
-                PORTB &= ~_BV(PWRSUPPORT);
-                enableInt0();
-            }
+            cli();
+            clrFlagButton();
+            sei();
+            handleButtonPressed();
         }
 
-
         asm("sleep"::);
-
     }
 }
 

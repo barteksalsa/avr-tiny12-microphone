@@ -1,7 +1,7 @@
-rm -f micro.o micro.hex micro.elf
+rm -f micro.o micro.hex micro.elf micro.objdump
 
 echo "C compiler" &&\
-avr-gcc -ffunction-sections -fdata-sections -g -O4 -mmcu=at90s2313 -c micro.c &&\
+avr-gcc -Wall -ffunction-sections -fdata-sections -g -O4 -mmcu=at90s2313 -c micro.c &&\
 echo "C linker" &&\
 avr-gcc -Wl,--gc-sections -mmcu=attiny12 -o micro.elf micro.o &&\
 echo "C dumps" &&\
